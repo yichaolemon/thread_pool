@@ -5,18 +5,19 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"time"
 )
 
 type ThreadPool struct {
 	corePoolSize 		int
 	maxPoolSize 		int
-	keepAliveTimeMs int
+	keepAliveTime time.Duration
 	taskQueue 			[]Task
 	lock 						sync.Mutex
 	taskQueueEmpty	*sync.Cond
 	taskQueueFull 	*sync.Cond
 	shutdown 				chan struct{}
-	drainedThreads		chan struct{} // used for draining threads after executor shutdown
+	drainedThreads	chan struct{} // used for draining threads after executor shutdown
 	numAliveThreads int
 	taskQueueMaxSize int
 }
@@ -41,8 +42,8 @@ func (f *Future) Put(result interface{}) {
 	close(f.done)
 }
 
-func NewDefaultThreadPool(corePoolSize int, maxPoolSize int, keepAliveTimeMs int) *ThreadPool {
-	return NewThreadPool(corePoolSize, maxPoolSize, keepAliveTimeMs, math.MaxInt16)
+func NewDefaultThreadPool(corePoolSize int, maxPoolSize int) *ThreadPool {
+	return NewThreadPool(corePoolSize, maxPoolSize, math.MaxInt16, math.MaxInt16)
 }
 
 func NewThreadPool(corePoolSize int, maxPoolSize int, keepAliveTimeMs int, 
@@ -50,13 +51,26 @@ func NewThreadPool(corePoolSize int, maxPoolSize int, keepAliveTimeMs int,
 	threadPool := new(ThreadPool)
 	threadPool.corePoolSize = corePoolSize
 	threadPool.maxPoolSize = maxPoolSize
-	threadPool.keepAliveTimeMs = keepAliveTimeMs
+	threadPool.keepAliveTime = time.Millisecond * time.Duration(keepAliveTimeMs)
 	threadPool.taskQueue = make([]Task, 0)
 	threadPool.taskQueueEmpty = sync.NewCond(&threadPool.lock)
 	threadPool.taskQueueFull = sync.NewCond(&threadPool.lock)
 	threadPool.shutdown = make(chan struct{})
 	threadPool.drainedThreads = make(chan struct{})
 	threadPool.taskQueueMaxSize = taskQueueMaxSize
+
+	// periodically calls Braodcast to wake up threads waiting to dequeue from task queue
+	ticker := time.NewTicker(10 * time.Millisecond)
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				threadPool.taskQueueEmpty.Broadcast()
+			case <-threadPool.shutdown:
+				return
+			}
+		}
+	}()
 
 	// initialize worker threads
 	for i := 1; i <= corePoolSize; i++ {
@@ -71,9 +85,24 @@ func (t *ThreadPool) createNewThread() {
 		for {
 			task := t.dequeue()
 			if task == nil {
-				// has shutdown, exit
-				t.drainedThreads <- struct{}{}
-				break
+				if t.isShutdown() {
+					// has shutdown, drain thread
+					t.drainedThreads <- struct{}{}
+					t.lock.Lock()
+					t.numAliveThreads -= 1
+					t.lock.Unlock()
+					break
+				} else {
+					// timed out, check if can kill this thread
+					t.lock.Lock()
+					if (t.numAliveThreads > t.corePoolSize) {
+						fmt.Printf("thread timed out\n")
+						t.numAliveThreads -= 1
+						t.lock.Unlock()
+						break
+					}
+					t.lock.Unlock()
+				}
 			}
 			result := task.executable()
 			task.future.Put(result)
@@ -81,14 +110,17 @@ func (t *ThreadPool) createNewThread() {
 	}()
 	t.lock.Lock()
 	defer t.lock.Unlock()
-	fmt.Printf("new-thread-{%d} added\n", t.numAliveThreads+1)
 	t.numAliveThreads += 1
+	fmt.Printf("new-thread-{%d} added\n", t.numAliveThreads)
 }
 
 func (t *ThreadPool) dequeue() *Task {
 	t.lock.Lock()
 	defer t.lock.Unlock()
-	for len(t.taskQueue) == 0 && !t.isShutdown() {
+
+	waitStartTime := time.Now()
+	for len(t.taskQueue) == 0 && !t.isShutdown() && 
+	!(time.Since(waitStartTime) > t.keepAliveTime && t.numAliveThreads > t.corePoolSize) {
 		t.taskQueueEmpty.Wait()
 	}
 	if len(t.taskQueue) == 0 {
@@ -148,20 +180,24 @@ func (t *ThreadPool) shutdownPool() {
 	close(t.shutdown)
 	numThreadsToDrain := t.numAliveThreads
 	t.lock.Unlock()
-	for i := 0; i < numThreadsToDrain; i++ {
+	// needs to wake up threads waiting on deque
+	t.taskQueueEmpty.Broadcast()
+	for i := 1; i <= numThreadsToDrain; i++ {
+		fmt.Printf("draining %d/%d threads\n", i, numThreadsToDrain)
 		<- t.drainedThreads
 	}
 }
 
 func main() {
-	pool := NewThreadPool(10, 20, 1000, 20)
-	for i := 1; i <= 300; i++ {
+	pool := NewThreadPool(15, 30, 50, 50)
+	for i := 1; i <= 1000; i++ {
 		i := i
 		pool.submit(func()(interface{}){ 
 			fmt.Printf("printing %d\n", i) 
 			return nil
 		})
 	}
+	time.Sleep(time.Second * 3)
 	pool.shutdownPool()
 }
 
