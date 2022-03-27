@@ -103,9 +103,10 @@ func (t *ThreadPool) createNewThread() {
 					}
 					t.lock.Unlock()
 				}
+			} else {
+				result := task.executable()
+				task.future.Put(result)
 			}
-			result := task.executable()
-			task.future.Put(result)
 		}
 	}()
 	t.lock.Lock()
